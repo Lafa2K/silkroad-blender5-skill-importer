@@ -1,0 +1,27 @@
+# Local game/client data
+extracted/
+JenxSro Cap 110/
+*.pk2
+*.PK2
+*.7z
+*.zip
+*.rar
+pk2_*.ps1
+
+# Blender/runtime caches
+__pycache__/
+*.pyc
+*.pyo
+*.blend1
+*.blend2
+
+# Local importer config and generated assets
+silkroad_importer_config.json
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
