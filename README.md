@@ -83,4 +83,4 @@ These are useful when inspecting how a skill is structured.
 
 ## License
 
-No license has been selected yet. Add a license file before distributing under a specific open-source license.
+MIT. See `LICENSE`.

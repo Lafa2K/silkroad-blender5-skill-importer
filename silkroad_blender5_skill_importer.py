@@ -327,6 +327,15 @@ def sr_vec_to_blender(value):
     return Vector((x, -z, y))
 
 
+def sr_scale_to_blender(value, multiplier=1.0):
+    x, y, z = value
+    return Vector((abs(x) * multiplier, abs(y) * multiplier, abs(z) * multiplier))
+
+
+def sr_object_matrix_to_blender(value):
+    return SR_TO_BLENDER.to_4x4() @ value @ BLENDER_TO_SR.to_4x4()
+
+
 def sr_quat_to_blender(value):
     x, y, z, w = value
     q = Quaternion((w, x, y, z))
@@ -1521,15 +1530,23 @@ def apply_efp_commands(empty, efp_object, fps, scale):
                 start = frame_from_ms(source.start * 1000.0, fps)
                 step = 1.0
                 for index, mat in enumerate(frames):
-                    converted = SR_TO_BLENDER.to_4x4() @ mat @ BLENDER_TO_SR.to_4x4()
+                    converted = sr_object_matrix_to_blender(mat)
                     empty.rotation_quaternion = converted.to_quaternion()
                     empty.keyframe_insert("rotation_quaternion", frame=start + step * index)
+        elif source.command in {"SetRotationMat", "SetRVelocityMat"} and source.value:
+            empty.rotation_mode = "QUATERNION"
+            empty.rotation_quaternion = sr_object_matrix_to_blender(source.value).to_quaternion()
+        elif source.command in {"SetRotation", "SetRVelocity", "SetRotationAxis", "SetShapeRot", "SetShapeRotVel"} and isinstance(source.value, dict):
+            mat = source.value.get("matrix")
+            if mat is not None:
+                empty.rotation_mode = "QUATERNION"
+                empty.rotation_quaternion = sr_object_matrix_to_blender(mat).to_quaternion()
         elif source.command == "SetGraphScale" and isinstance(source.value, list) and source.value:
             start = frame_from_ms(source.start * 1000.0, fps)
             end = frame_from_ms(source.end * 1000.0, fps) if source.end > source.start else start + len(source.value)
             step = (end - start) / max(1, len(source.value) - 1)
             for index, vec in enumerate(source.value):
-                empty.scale = sr_vec_to_blender(vec)
+                empty.scale = sr_scale_to_blender(vec, scale)
                 empty.keyframe_insert("scale", frame=start + step * index)
 
 
@@ -2077,18 +2094,67 @@ def point_object_toward(obj, target_location):
     obj.rotation_quaternion = direction.to_track_quat("Y", "Z")
 
 
-def skill_cue_frame_range(context, cue):
+def build_skill_cue_timing(context, cues):
     fps = context.scene.render.fps or 30
-    start = float(context.scene.frame_start) + max(0, cue.sequence - 1) * 3.0 + (cue.delay_ms / 1000.0) * fps
+    frame_start = float(context.scene.frame_start)
+    frame_end = float(context.scene.frame_end)
+    duration_frames = max(1.0, frame_end - frame_start)
+    duration_ms = (duration_frames / float(fps)) * 1000.0
+
+    sequences = sorted({cue.sequence for cue in cues if cue.sequence > 0})
+    if not sequences:
+        return {}, False
+
+    delay_by_sequence = {}
+    for sequence in sequences:
+        delays = [cue.delay_ms for cue in cues if cue.sequence == sequence and cue.delay_ms > 0]
+        if delays:
+            delay_by_sequence[sequence] = min(delays)
+
+    use_delay_times = False
+    if len(delay_by_sequence) >= 2:
+        ordered = [delay_by_sequence.get(sequence, 0) for sequence in sequences]
+        nonzero_ordered = [value for value in ordered if value > 0]
+        use_delay_times = (
+            len(nonzero_ordered) >= 2
+            and nonzero_ordered == sorted(nonzero_ordered)
+            and max(nonzero_ordered) <= max(duration_ms + 200.0, 200.0)
+        )
+    elif len(delay_by_sequence) == 1 and len(sequences) == 1:
+        only_delay = next(iter(delay_by_sequence.values()))
+        use_delay_times = only_delay <= max(duration_ms + 200.0, 200.0)
+
+    timings = {}
+    for index, sequence in enumerate(sequences):
+        if use_delay_times and sequence in delay_by_sequence:
+            timings[sequence] = frame_start + (delay_by_sequence[sequence] / 1000.0) * fps
+        else:
+            timings[sequence] = frame_start + ((index + 1) / (len(sequences) + 1)) * duration_frames
+    return timings, use_delay_times
+
+
+def skill_cue_frame_range(context, cue, sequence_timing=None):
+    fps = context.scene.render.fps or 30
+    frame_start = float(context.scene.frame_start)
+    if cue.sequence > 0 and sequence_timing and cue.sequence in sequence_timing:
+        start = sequence_timing[cue.sequence]
+    elif cue.delay_ms > 0:
+        start = frame_start + (cue.delay_ms / 1000.0) * fps
+    elif cue.sequence > 0:
+        duration_frames = max(1.0, float(context.scene.frame_end - context.scene.frame_start))
+        start = frame_start + min(0.85, max(0.15, cue.sequence / max(2.0, cue.sequence + 1.0))) * duration_frames
+    else:
+        start = frame_start
+
     if skill_cue_is_projectile(cue):
         duration_ms = cue.move_params[-1] if cue.move_params else 350.0
         duration = max(4.0, (max(120.0, duration_ms) / 1000.0) * fps)
     else:
-        duration = max(12.0, float(context.scene.frame_end - context.scene.frame_start))
+        duration = max(6.0, min(18.0, float(context.scene.frame_end - context.scene.frame_start) * 0.25))
     return start, start + duration
 
 
-def create_skill_cue_anchor(context, cue, parent, collection, scale, target=None):
+def create_skill_cue_anchor(context, cue, parent, collection, scale, target=None, sequence_timing=None):
     anchor = bpy.data.objects.new(safe_name(f"{cue.action}_{cue.sequence}_{cue.move_type}"), None)
     anchor.empty_display_type = "ARROWS" if skill_cue_is_projectile(cue) else "SPHERE"
     anchor.empty_display_size = 0.35 * scale
@@ -2106,14 +2172,15 @@ def create_skill_cue_anchor(context, cue, parent, collection, scale, target=None
         anchor.parent = parent
         anchor.matrix_parent_inverse = Matrix.Identity(4)
 
-    start_frame, end_frame = skill_cue_frame_range(context, cue)
+    start_frame, end_frame = skill_cue_frame_range(context, cue, sequence_timing)
     if use_target:
+        target_location = skill_cue_world_target(target, cue, scale)
         anchor.location = skill_cue_world_start(parent, cue, scale)
-        point_object_toward(anchor, skill_cue_world_target(target, cue, scale))
+        point_object_toward(anchor, target_location)
         anchor.keyframe_insert("location", frame=start_frame)
         anchor.keyframe_insert("rotation_quaternion", frame=start_frame)
-        anchor.location = skill_cue_world_target(target, cue, scale)
-        point_object_toward(anchor, anchor.location)
+        anchor.location = target_location
+        point_object_toward(anchor, target_location)
         anchor.keyframe_insert("location", frame=end_frame)
         anchor.keyframe_insert("rotation_quaternion", frame=end_frame)
         anchor["silkroad_target"] = target.name
@@ -2131,16 +2198,19 @@ def create_skill_cue_anchor(context, cue, parent, collection, scale, target=None
     anchor["silkroad_attach_bone"] = cue.bone_name
     anchor["silkroad_start_offset"] = json.dumps([round(value, 4) for value in cue.start_offset])
     anchor["silkroad_target_offset"] = json.dumps([round(value, 4) for value in cue.target_offset])
+    anchor["silkroad_start_frame"] = round(start_frame, 4)
+    anchor["silkroad_end_frame"] = round(end_frame, 4)
     return anchor
 
 
-def parent_objects_to_anchor(objects, anchor):
+def parent_objects_to_anchor(objects, anchor, scale=1.0):
     for obj in objects:
         if not obj:
             continue
         obj.parent = anchor
         obj.matrix_parent_inverse = Matrix.Identity(4)
         obj.location = (0, 0, 0)
+        obj.scale = (scale, scale, scale)
         obj["silkroad_skill_anchor"] = anchor.name
 
 
@@ -2171,7 +2241,7 @@ def import_skill_cue_resource(context, resolver, raw_path, game_root, anchor, co
         roots = [child_armature] if child_armature else [obj for obj in objects if obj and not obj.parent]
         if not roots:
             roots = objects
-        parent_objects_to_anchor(roots, anchor)
+        parent_objects_to_anchor(roots, anchor, props.effect_scale)
         for root in roots:
             root["silkroad_skill_cue_resource"] = raw_path
         return 1 if roots else 0
@@ -2183,14 +2253,16 @@ def import_skill_cues(context, props, skill, armature=None, effect_parent=None, 
         return 0
     resolver = AssetResolver(props.game_root)
     collection = effect_collection or ensure_named_collection(context, EFFECT_COLLECTION)
+    sequence_timing, used_delays = build_skill_cue_timing(context, skill.cues)
     imported = 0
     for cue in skill.cues:
         resources = cue_resource_paths(cue)
         if not resources:
             continue
         parent = skill_cue_parent_candidates(cue, armature, effect_parent, props)
-        anchor = create_skill_cue_anchor(context, cue, parent, collection, props.effect_scale, props.skill_target)
+        anchor = create_skill_cue_anchor(context, cue, parent, collection, props.effect_scale, props.skill_target, sequence_timing)
         anchor["silkroad_skill_code"] = skill.code
+        anchor["silkroad_timing_source"] = "delay_ms" if used_delays else "animation_spread"
         for raw_path in resources:
             try:
                 imported += import_skill_cue_resource(context, resolver, raw_path, props.game_root, anchor, collection, props, skill, cue)
