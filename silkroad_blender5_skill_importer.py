@@ -320,6 +320,7 @@ class SkillEffectInfo:
     texture_paths: list
     raw_line: str
     cues: list = field(default_factory=list)
+    animations: list = field(default_factory=list)
 
 
 def sr_vec_to_blender(value):
@@ -1533,14 +1534,16 @@ def apply_efp_commands(empty, efp_object, fps, scale):
                     converted = sr_object_matrix_to_blender(mat)
                     empty.rotation_quaternion = converted.to_quaternion()
                     empty.keyframe_insert("rotation_quaternion", frame=start + step * index)
-        elif source.command in {"SetRotationMat", "SetRVelocityMat"} and source.value:
+        elif source.command == "SetRotationMat" and source.value:
             empty.rotation_mode = "QUATERNION"
             empty.rotation_quaternion = sr_object_matrix_to_blender(source.value).to_quaternion()
-        elif source.command in {"SetRotation", "SetRVelocity", "SetRotationAxis", "SetShapeRot", "SetShapeRotVel"} and isinstance(source.value, dict):
+        elif source.command in {"SetRotation", "SetRotationAxis"} and isinstance(source.value, dict):
             mat = source.value.get("matrix")
             if mat is not None:
                 empty.rotation_mode = "QUATERNION"
                 empty.rotation_quaternion = sr_object_matrix_to_blender(mat).to_quaternion()
+        elif source.command in {"SetRVelocityMat", "SetRVelocity", "SetRVelocityAxis", "SetShapeRot", "SetShapeRotVel"}:
+            empty["silkroad_ignored_internal_rotation"] = source.command
         elif source.command == "SetGraphScale" and isinstance(source.value, list) and source.value:
             start = frame_from_ms(source.start * 1000.0, fps)
             end = frame_from_ms(source.end * 1000.0, fps) if source.end > source.start else start + len(source.value)
@@ -1685,6 +1688,32 @@ def parse_skill_cue_tokens(tokens, raw_line):
     )
 
 
+def extract_animation_tokens(tokens):
+    animations = []
+    for token in tokens:
+        if not token.startswith("ANI_"):
+            continue
+        for part in token.split(","):
+            part = part.strip()
+            if part.startswith("ANI_") and part not in animations:
+                animations.append(part)
+    return animations
+
+
+def choose_primary_animation(animations):
+    if not animations:
+        return ""
+    for animation in animations:
+        token = animation.upper()
+        if token.startswith("ANI_SKILL_"):
+            return animation
+    for animation in animations:
+        token = animation.upper()
+        if "READY" not in token and "WAIT" not in token:
+            return animation
+    return animations[0]
+
+
 def parse_skill_effects(game_root):
     path = Path(game_root) / "Media" / "server_dep" / "silkroad" / "textdata" / "skilleffect.txt"
     if not path.exists():
@@ -1718,11 +1747,12 @@ def parse_skill_effects(game_root):
             cue = parse_skill_cue_tokens(tokens, line)
             if cue:
                 cues_by_code.setdefault(normalized_skill_cue_code(code), []).append(cue)
-            animation = next((token for token in tokens if token.startswith("ANI_")), "")
+            animations = extract_animation_tokens(tokens)
+            animation = choose_primary_animation(animations)
             weapon = next((token for token in tokens if token.upper() in weapons), "")
             efps = [token for token in tokens if token.lower().endswith(".efp")]
             textures = [token for token in tokens if token.lower().endswith(".ddj")]
-            infos.append(SkillEffectInfo(code, animation, weapon.lower(), efps, textures, line))
+            infos.append(SkillEffectInfo(code, animation, weapon.lower(), efps, textures, line, animations=animations))
     for info in infos:
         info.cues = list(cues_by_code.get(normalized_skill_cue_code(info.code), []))
     _SKILL_EFFECT_CACHE[cache_key] = {"signature": signature, "infos": infos}
@@ -2223,6 +2253,35 @@ def cue_resource_paths(cue):
     return paths
 
 
+def apply_cue_bsr_animation(context, props, child_armature, bsr):
+    if not child_armature or not bsr or not bsr.animation_paths:
+        return False
+    resolver = AssetResolver(props.game_root)
+    ban_path = None
+    for raw_path in bsr.animation_paths:
+        ban_path = resolver.resolve(raw_path, prefer="Data")
+        if ban_path:
+            break
+    if not ban_path:
+        return False
+
+    scene = context.scene
+    saved = (scene.frame_start, scene.frame_end, scene.render.fps, scene.frame_current)
+    try:
+        ban = apply_ban_to_armature(context, child_armature, ban_path)
+        child_armature["silkroad_cue_animation"] = ban.name
+        return True
+    except Exception as exc:
+        print(f"Silkroad importer: cue BSR animation failed {ban_path}: {exc}")
+        return False
+    finally:
+        scene.frame_start, scene.frame_end, scene.render.fps, frame_current = saved
+        try:
+            scene.frame_set(frame_current)
+        except Exception:
+            pass
+
+
 def import_skill_cue_resource(context, resolver, raw_path, game_root, anchor, collection, props, skill, cue):
     suffix = Path(normalized_relpath(raw_path)).suffix.lower()
     prefer = "Particles" if suffix == ".efp" else "Data"
@@ -2237,7 +2296,8 @@ def import_skill_cue_resource(context, resolver, raw_path, game_root, anchor, co
         root["silkroad_skill_cue_resource"] = raw_path
         return 1
     if suffix == ".bsr":
-        child_armature, objects, _ = import_bsr_to_scene(context, path, game_root, collection_name=collection_name, flip_uv=props.flip_uv_v, flip_winding=props.flip_winding, parent_collection=collection)
+        child_armature, objects, bsr = import_bsr_to_scene(context, path, game_root, collection_name=collection_name, flip_uv=props.flip_uv_v, flip_winding=props.flip_winding, parent_collection=collection)
+        apply_cue_bsr_animation(context, props, child_armature, bsr)
         roots = [child_armature] if child_armature else [obj for obj in objects if obj and not obj.parent]
         if not roots:
             roots = objects
