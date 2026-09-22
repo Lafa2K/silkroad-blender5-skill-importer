@@ -1015,7 +1015,7 @@ def parse_efp(path):
     return EfpEffect(Path(path), version, scale, read_efp_object(reader))
 
 
-def make_material(name, resolver, material_info=None, texture_path=None, base_color=(0.8, 0.8, 0.8, 1.0), alpha=True):
+def make_material(name, resolver, material_info=None, texture_path=None, base_color=(0.8, 0.8, 0.8, 1.0), alpha=True, roughness=0.5):
     mat = bpy.data.materials.new(safe_name(name))
     mat.use_nodes = True
     mat.blend_method = "BLEND" if alpha else "OPAQUE"
@@ -1035,6 +1035,8 @@ def make_material(name, resolver, material_info=None, texture_path=None, base_co
 
     if bsdf.inputs.get("Base Color"):
         bsdf.inputs["Base Color"].default_value = color
+    if bsdf.inputs.get("Roughness"):
+        bsdf.inputs["Roughness"].default_value = roughness
     if bsdf.inputs.get("Alpha"):
         bsdf.inputs["Alpha"].default_value = (color[3] if len(color) > 3 else 1.0) if alpha else 1.0
 
@@ -1071,7 +1073,7 @@ def infer_material_path_for_mesh(mesh_path, material_name):
     return Path(*parts).with_name(f"{material_name}.bmt")
 
 
-def create_mesh_object(mesh_data, name, resolver, material_lookup, armature=None, collection=None, flip_uv=True, flip_winding=True):
+def create_mesh_object(mesh_data, name, resolver, material_lookup, armature=None, collection=None, flip_uv=True, flip_winding=True, use_diffuse_alpha=True, roughness=1.0):
     positions = [sr_vec_to_blender(v.position) for v in mesh_data.vertices]
     vertex_count = len(positions)
     faces = []
@@ -1098,7 +1100,7 @@ def create_mesh_object(mesh_data, name, resolver, material_lookup, armature=None
     (collection or bpy.context.collection).objects.link(obj)
 
     material_info = material_lookup.get(mesh_data.material_name)
-    mat = make_material(mesh_data.material_name or name, resolver, material_info=material_info, alpha=False)
+    mat = make_material(mesh_data.material_name or name, resolver, material_info=material_info, alpha=use_diffuse_alpha, roughness=roughness)
     obj.data.materials.append(mat)
 
     if mesh_data.bone_names:
@@ -1174,7 +1176,7 @@ def create_armature(skeleton, name, collection=None, only_bones=None):
     return arm_obj
 
 
-def import_bsr_to_scene(context, bsr_path, game_root, collection_name=None, flip_uv=True, flip_winding=True, target_armature=None, parent_collection=None):
+def import_bsr_to_scene(context, bsr_path, game_root, collection_name=None, flip_uv=True, flip_winding=True, target_armature=None, parent_collection=None, use_diffuse_alpha=True, roughness=1.0):
     resolver = AssetResolver(game_root)
     bsr_path = Path(bsr_path)
     bsr = parse_bsr(bsr_path)
@@ -1243,7 +1245,7 @@ def import_bsr_to_scene(context, bsr_path, game_root, collection_name=None, flip
     imported = []
     for parsed in parsed_meshes:
         try:
-            obj = create_mesh_object(parsed.mesh, parsed.mesh.name, resolver, material_lookup, armature, collection, flip_uv, flip_winding)
+            obj = create_mesh_object(parsed.mesh, parsed.mesh.name, resolver, material_lookup, armature, collection, flip_uv, flip_winding, use_diffuse_alpha, roughness)
             imported.append(obj)
         except Exception as exc:
             print(f"Silkroad importer: mesh import failed {parsed.path}: {exc}")
@@ -1252,6 +1254,15 @@ def import_bsr_to_scene(context, bsr_path, game_root, collection_name=None, flip
         context.view_layer.objects.active = armature
         armature.select_set(True)
     return armature, imported, bsr
+
+
+def bsr_import_options(props):
+    return {
+        "flip_uv": props.flip_uv_v,
+        "flip_winding": props.flip_winding,
+        "use_diffuse_alpha": props.use_diffuse_alpha,
+        "roughness": props.material_roughness,
+    }
 
 
 def frame_from_ms(ms, fps):
@@ -2296,7 +2307,7 @@ def import_skill_cue_resource(context, resolver, raw_path, game_root, anchor, co
         root["silkroad_skill_cue_resource"] = raw_path
         return 1
     if suffix == ".bsr":
-        child_armature, objects, bsr = import_bsr_to_scene(context, path, game_root, collection_name=collection_name, flip_uv=props.flip_uv_v, flip_winding=props.flip_winding, parent_collection=collection)
+        child_armature, objects, bsr = import_bsr_to_scene(context, path, game_root, collection_name=collection_name, parent_collection=collection, **bsr_import_options(props))
         apply_cue_bsr_animation(context, props, child_armature, bsr)
         roots = [child_armature] if child_armature else [obj for obj in objects if obj and not obj.parent]
         if not roots:
@@ -2368,7 +2379,7 @@ def ensure_skill_armature(context, props):
     path = Path(props.default_character_bsr)
     if not path.exists():
         path = Path(props.game_root) / DEFAULT_CHARACTER_BSR
-    armature, _, _ = import_bsr_to_scene(context, path, props.game_root, flip_uv=props.flip_uv_v, flip_winding=props.flip_winding)
+    armature, _, _ = import_bsr_to_scene(context, path, props.game_root, **bsr_import_options(props))
     props.target_armature = armature
     return armature
 
@@ -2483,6 +2494,18 @@ class SilkroadImporterProperties(PropertyGroup):
     )
     flip_uv_v: BoolProperty(name="Flip Texture V", default=True)
     flip_winding: BoolProperty(name="Flip Faces", default=True)
+    use_diffuse_alpha: BoolProperty(
+        name="Diffuse Alpha",
+        default=True,
+        description="Use the diffuse texture's alpha channel for imported models, clothing, characters, and mobs",
+    )
+    material_roughness: FloatProperty(
+        name="Roughness",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        description="Surface roughness of imported model materials (1.0 removes glossy reflections)",
+    )
     effect_scale: FloatProperty(name="Effect Scale", default=1.0, min=0.01, max=100.0)
     auto_attach_rotation: BoolProperty(
         name="Auto Attach Rotation",
@@ -2524,7 +2547,7 @@ class SILKROAD_OT_import_bsr(Operator, ImportHelper):
         props = context.scene.silkroad_importer
         try:
             target = active_armature(context) or props.target_armature
-            armature, objects, _ = import_bsr_to_scene(context, self.filepath, props.game_root, flip_uv=props.flip_uv_v, flip_winding=props.flip_winding, target_armature=target)
+            armature, objects, _ = import_bsr_to_scene(context, self.filepath, props.game_root, target_armature=target, **bsr_import_options(props))
             self.report({"INFO"}, f"Imported {len(objects)} mesh objects" + (" with armature" if armature else ""))
             return {"FINISHED"}
         except Exception as exc:
@@ -2544,7 +2567,7 @@ class SILKROAD_OT_import_default_character(Operator):
         if not path.exists():
             path = Path(props.game_root) / DEFAULT_CHARACTER_BSR
         try:
-            import_bsr_to_scene(context, path, props.game_root, flip_uv=props.flip_uv_v, flip_winding=props.flip_winding)
+            import_bsr_to_scene(context, path, props.game_root, **bsr_import_options(props))
             self.report({"INFO"}, "Base character imported")
             return {"FINISHED"}
         except Exception as exc:
@@ -2574,7 +2597,7 @@ class SILKROAD_OT_import_preset_character(Operator):
             clear_collection_contents(char_collection)
             clear_collection_contents(ensure_named_collection(context, WEAPON_COLLECTION))
             clear_collection_contents(ensure_named_collection(context, EFFECT_COLLECTION))
-            armature, _, _ = import_bsr_to_scene(context, path, props.game_root, collection_name="Character_" + safe_name(record["id"]), flip_uv=props.flip_uv_v, flip_winding=props.flip_winding, parent_collection=char_collection)
+            armature, _, _ = import_bsr_to_scene(context, path, props.game_root, collection_name="Character_" + safe_name(record["id"]), parent_collection=char_collection, **bsr_import_options(props))
             if not armature:
                 raise SilkroadError("Character preset did not create an armature")
             armature["silkroad_role"] = "character"
@@ -2646,7 +2669,7 @@ class SILKROAD_OT_equip_preset_weapon(Operator):
         try:
             weapon_collection = ensure_named_collection(context, WEAPON_COLLECTION)
             clear_collection_contents(weapon_collection)
-            armature, _, bsr = import_bsr_to_scene(context, path, props.game_root, collection_name="Weapon_" + safe_name(record["id"]), flip_uv=props.flip_uv_v, flip_winding=props.flip_winding, parent_collection=weapon_collection)
+            armature, _, bsr = import_bsr_to_scene(context, path, props.game_root, collection_name="Weapon_" + safe_name(record["id"]), parent_collection=weapon_collection, **bsr_import_options(props))
             if not armature:
                 raise SilkroadError("Weapon preset did not create an armature")
             rotation_offset, preset_name = infer_attach_rotation(armature) if props.auto_attach_rotation else (tuple(props.attach_rotation), "manual")
@@ -2923,6 +2946,9 @@ class SILKROAD_PT_importer(Panel):
         row = layout.row(align=True)
         row.prop(props, "flip_uv_v")
         row.prop(props, "flip_winding")
+        row = layout.row(align=True)
+        row.prop(props, "use_diffuse_alpha")
+        row.prop(props, "material_roughness")
         layout.prop(props, "auto_action_timeline")
         layout.prop(props, "effect_scale")
 
