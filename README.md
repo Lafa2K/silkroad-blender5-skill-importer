@@ -4,6 +4,8 @@ Blender 5 addon for studying and recreating Silkroad Online character resources,
 
 The importer is focused on research and visualization. It does not include any Silkroad game files, PK2 archives, models, textures, or other proprietary assets.
 
+> **Work in progress — skill playback is not yet 100% game-accurate.** Timing, projectiles, attachments, buffs, and some VFX are still being investigated and improved. Use the current skill preview for research, not as a definitive reproduction of in-game behavior.
+
 ## Highlights
 
 - Imports Silkroad `.bsr` resources with meshes, materials, skeletons, and animation tables.
@@ -13,6 +15,7 @@ The importer is focused on research and visualization. It does not include any S
 - Imports visual `.efp` effects as Blender proxy objects.
 - Supports character and weapon presets through a local JSON config.
 - Attaches weapons/items to character bones such as `Bip01 R Hand`.
+- Uses diffuse texture alpha by default for imported model materials and exposes a roughness control (default `1.0`). In Blender 5, alpha materials use the Dithered render method.
 - Optional skill cue offsets:
   - reads `READY`, `WAIT`, `SHOT`, `ACT_S`, `ACT_L`, and related cue rows from `skilleffect.txt`;
   - reads attach modes such as `AT_MOV_1TAR`, `AT_ONE_FOLLOW`, and `AT_LOOP`;

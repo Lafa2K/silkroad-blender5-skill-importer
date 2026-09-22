@@ -1018,7 +1018,14 @@ def parse_efp(path):
 def make_material(name, resolver, material_info=None, texture_path=None, base_color=(0.8, 0.8, 0.8, 1.0), alpha=True, roughness=0.5):
     mat = bpy.data.materials.new(safe_name(name))
     mat.use_nodes = True
-    mat.blend_method = "BLEND" if alpha else "OPAQUE"
+    if alpha:
+        # Blender 5: avoid the sorting artifacts of Blended on cutout textures.
+        if hasattr(mat, "surface_render_method"):
+            mat.surface_render_method = "DITHERED"
+        else:
+            mat.blend_method = "HASHED"
+    else:
+        mat.blend_method = "OPAQUE"
     if hasattr(mat, "use_screen_refraction"):
         mat.use_screen_refraction = False
     if hasattr(mat, "show_transparent_back"):
