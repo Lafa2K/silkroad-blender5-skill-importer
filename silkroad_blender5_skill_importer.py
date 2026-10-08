@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Silkroad Skill/VFX Importer",
     "author": "Codex",
-    "version": (0, 2, 0),
+    "version": (0, 2, 3),
     "blender": (5, 0, 0),
     "location": "View3D Sidebar > Silkroad",
     "description": "Imports Silkroad Online BSR/BMS/BSK/BAN assets and EFP skill effects.",
@@ -26,7 +26,7 @@ from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 
-DEFAULT_GAME_ROOT = r"D:\claude\silkroad"
+DEFAULT_GAME_ROOT = r"D:\silkroad-project\extracted"
 DEFAULT_CHARACTER_BSR = r"Data\res\char\china\chinaman_adventurer.bsr"
 DEFAULT_CONFIG_NAME = "silkroad_importer_config.json"
 CP949 = "cp949"
@@ -254,6 +254,12 @@ class EfpResource:
     two_sided: int = 0
     src_blend: int = 5
     dst_blend: int = 6
+    src_texture_arg1: int = 2
+    src_texture_arg2: int = 0
+    src_texture_op: int = 4
+    dst_texture_arg1: int = 2
+    dst_texture_arg2: int = 0
+    dst_texture_op: int = 4
     meshes: list = field(default_factory=list)
 
 
@@ -265,6 +271,7 @@ class EfpSource:
     start: float = 0.0
     end: float = 0.0
     value: object = None
+    span: float = 0.0
 
 
 @dataclass
@@ -284,6 +291,7 @@ class EfpObject:
     int1: int = 0
     int2: int = 0
     int3: int = 0
+    global_data_int: int = 0
 
 
 @dataclass
@@ -330,7 +338,9 @@ def sr_vec_to_blender(value):
 
 def sr_scale_to_blender(value, multiplier=1.0):
     x, y, z = value
-    return Vector((abs(x) * multiplier, abs(y) * multiplier, abs(z) * multiplier))
+    # Silkroad Y is Blender Z. Keep signed scales: some effects intentionally
+    # mirror a plate while animating it.
+    return Vector((x * multiplier, z * multiplier, y * multiplier))
 
 
 def sr_object_matrix_to_blender(value):
@@ -900,10 +910,10 @@ def read_source(reader):
     byte1 = reader.u8()
     start = reader.f32()
     end = reader.f32()
-    float2 = reader.f32()
+    span = reader.f32()
     param_name = PARAM_BY_COMMAND.get(command)
     value = read_parameter(reader, param_name) if param_name else None
-    return EfpSource(command, source_type, byte1, start, end, value)
+    return EfpSource(command, source_type, byte1, start, end, value, span)
 
 
 def read_source_list(reader):
@@ -915,12 +925,12 @@ def read_resource(reader):
     resource.two_sided = reader.u32()
     resource.src_blend = reader.i32()
     resource.dst_blend = reader.i32()
-    reader.i32()
-    reader.i32()
-    reader.i32()
-    reader.i32()
-    reader.i32()
-    reader.i32()
+    resource.src_texture_arg1 = reader.i32()
+    resource.src_texture_arg2 = reader.i32()
+    resource.src_texture_op = reader.i32()
+    resource.dst_texture_arg1 = reader.i32()
+    resource.dst_texture_arg2 = reader.i32()
+    resource.dst_texture_op = reader.i32()
     for _ in range(reader.i32()):
         mesh_path = reader.string()
         textures = [reader.string() for _ in range(reader.i32())]
@@ -958,12 +968,12 @@ def read_controller(reader, name):
 
 
 def read_global_data(reader):
-    reader.i32()
+    global_data_int = reader.i32()
     params = []
     for _ in range(reader.i32()):
         name = reader.string()
         params.append({"name": name, "value": read_parameter(reader, name)})
-    return params
+    return global_data_int, params
 
 
 def read_efp_object(reader):
@@ -974,7 +984,7 @@ def read_efp_object(reader):
         controller_name = reader.string()
         controllers.append(read_controller(reader, controller_name))
 
-    global_params = read_global_data(reader)
+    global_data_int, global_params = read_global_data(reader)
     read_source_list(reader)
     emitter_commands = read_source_list(reader)
     read_source_list(reader)
@@ -996,7 +1006,7 @@ def read_efp_object(reader):
     render_commands = read_source_list(reader)
 
     children = [read_efp_object(reader) for _ in range(reader.i32())]
-    return EfpObject(name, controllers, global_params, emitter_commands, lifetime_command, program_commands, view_command, render_command, render_commands, resource, children, int0, int1, int2, int3)
+    return EfpObject(name, controllers, global_params, emitter_commands, lifetime_command, program_commands, view_command, render_command, render_commands, resource, children, int0, int1, int2, int3, global_data_int)
 
 
 def parse_efp(path):
@@ -1070,6 +1080,184 @@ def make_material(name, resolver, material_info=None, texture_path=None, base_co
     return mat
 
 
+def set_effect_surface_blending(mat):
+    """Use true alpha blending for previews instead of screen-door dithering."""
+    if hasattr(mat, "surface_render_method"):
+        try:
+            mat.surface_render_method = "BLENDED"
+            return
+        except (TypeError, ValueError):
+            pass
+    if hasattr(mat, "blend_method"):
+        try:
+            mat.blend_method = "BLEND"
+        except (TypeError, ValueError):
+            pass
+
+
+def atlas_uv_transform(frame, image=None):
+    """Convert EasyFX top-left atlas coordinates to Blender UV transform."""
+    u, v, width, height = frame
+    offset_u = u
+    offset_v = 1.0 - v - height
+    scale_u = width
+    scale_v = height
+    if image and image.size[0] > 0 and image.size[1] > 0:
+        # Keep bilinear sampling half a texel inside the selected cell so the
+        # neighboring sprite cannot bleed into the flame at tile boundaries.
+        pad_u = 0.5 / float(image.size[0])
+        pad_v = 0.5 / float(image.size[1])
+        offset_u += pad_u
+        offset_v += pad_v
+        scale_u = max(0.0001, scale_u - (2.0 * pad_u))
+        scale_v = max(0.0001, scale_v - (2.0 * pad_v))
+    return (scale_u, scale_v, 1.0), (offset_u, offset_v, 0.0)
+
+
+def make_effect_material(name, resolver, resource, texture_path=None, texture_animation=None):
+    """Create an unlit EasyFX preview material.
+
+    Silkroad effect plates are composited sprites.  A lit Principled material
+    plus dithered transparency produces the grain/noise seen in Blender's
+    viewport, so effects use Transparent + Emission instead.
+    """
+    mat = bpy.data.materials.new(safe_name(name))
+    mat.use_nodes = True
+    set_effect_surface_blending(mat)
+    mat.diffuse_color = (1.0, 1.0, 1.0, 0.65)
+    if hasattr(mat, "use_screen_refraction"):
+        mat.use_screen_refraction = False
+    if hasattr(mat, "show_transparent_back"):
+        mat.show_transparent_back = True
+    if hasattr(mat, "use_backface_culling"):
+        mat.use_backface_culling = resource.two_sided in {2, 3}
+    if hasattr(mat, "surface_render_method") and hasattr(mat, "use_transparency_overlap"):
+        # Required for layered/crossing EasyFX plates. Without overlap Blender
+        # resolves the transparent layers against gray instead of compositing
+        # the complete effect.
+        mat.use_transparency_overlap = True
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    output = nodes.new(type="ShaderNodeOutputMaterial")
+    transparent = nodes.new(type="ShaderNodeBsdfTransparent")
+    emission = nodes.new(type="ShaderNodeEmission")
+    mix = nodes.new(type="ShaderNodeMixShader")
+    opacity = nodes.new(type="ShaderNodeMath")
+    tint = nodes.new(type="ShaderNodeMixRGB")
+    emission.name = "Silkroad Effect Emission"
+    opacity.name = "Silkroad Effect Opacity"
+    tint.name = "Silkroad Effect Tint"
+    opacity.operation = "MULTIPLY"
+    opacity.inputs[0].default_value = 1.0
+    opacity.inputs[1].default_value = 1.0
+    tint.blend_type = "MULTIPLY"
+    tint.inputs[0].default_value = 1.0
+    tint.inputs[1].default_value = (1.0, 1.0, 1.0, 1.0)
+    tint.inputs[2].default_value = (1.0, 1.0, 1.0, 1.0)
+    links.new(tint.outputs[0], emission.inputs["Color"])
+
+    additive = resource.dst_blend == 2 or (resource.src_blend == 5 and resource.dst_blend == 2)
+    emission.inputs["Strength"].default_value = 1.75 if additive else 1.0
+    links.new(opacity.outputs[0], mix.inputs[0])
+    links.new(transparent.outputs[0], mix.inputs[1])
+    links.new(emission.outputs[0], mix.inputs[2])
+    links.new(mix.outputs[0], output.inputs["Surface"])
+
+    tex = None
+    if texture_path:
+        try:
+            tex = resolver.loadable_texture(texture_path)
+        except Exception as exc:
+            print(f"Silkroad importer: could not extract effect texture {texture_path}: {exc}")
+    if tex and tex.exists():
+        try:
+            image = bpy.data.images.load(str(tex), check_existing=True)
+            if hasattr(image, "alpha_mode"):
+                image.alpha_mode = "STRAIGHT"
+            tex_node = nodes.new(type="ShaderNodeTexImage")
+            tex_node.image = image
+            tex_node.interpolation = "Linear"
+            if texture_animation and texture_animation.get("frames"):
+                tex_node.extension = "CLIP"
+                texcoord = nodes.new(type="ShaderNodeTexCoord")
+                uv_scale = nodes.new(type="ShaderNodeVectorMath")
+                uv_offset = nodes.new(type="ShaderNodeVectorMath")
+                uv_scale.operation = "MULTIPLY"
+                uv_offset.operation = "ADD"
+                uv_scale.name = "Silkroad Effect UV Scale"
+                uv_offset.name = "Silkroad Effect UV Offset"
+                scale, offset = atlas_uv_transform(texture_animation["frames"][0], image)
+                uv_scale.inputs[1].default_value = scale
+                uv_offset.inputs[1].default_value = offset
+                links.new(texcoord.outputs["UV"], uv_scale.inputs[0])
+                links.new(uv_scale.outputs[0], uv_offset.inputs[0])
+                links.new(uv_offset.outputs[0], tex_node.inputs["Vector"])
+            links.new(tex_node.outputs["Color"], tint.inputs[1])
+
+            alpha_socket = tex_node.outputs.get("Alpha")
+            if additive:
+                # Additive EasyFX textures commonly carry intensity in RGB on
+                # a black background.  Multiplying it by alpha removes the
+                # black rectangle without inventing opaque noise.
+                luminance = nodes.new(type="ShaderNodeRGBToBW")
+                links.new(tex_node.outputs["Color"], luminance.inputs["Color"])
+                if alpha_socket:
+                    multiply = nodes.new(type="ShaderNodeMath")
+                    multiply.operation = "MULTIPLY"
+                    links.new(alpha_socket, multiply.inputs[0])
+                    links.new(luminance.outputs["Val"], multiply.inputs[1])
+                    alpha_socket = multiply.outputs[0]
+                else:
+                    alpha_socket = luminance.outputs["Val"]
+            if alpha_socket:
+                links.new(alpha_socket, opacity.inputs[0])
+            mat["silkroad_texture"] = str(tex)
+            if texture_animation and texture_animation.get("atlas"):
+                columns, rows, step = texture_animation["atlas"]
+                mat["silkroad_texture_atlas"] = f"{columns}x{rows}"
+                mat["silkroad_texture_atlas_step"] = step
+        except Exception as exc:
+            print(f"Silkroad importer: could not load effect texture {tex}: {exc}")
+    else:
+        mat["silkroad_missing_texture"] = texture_path or ""
+
+    mat["silkroad_src_blend"] = resource.src_blend
+    mat["silkroad_dst_blend"] = resource.dst_blend
+    mat["silkroad_additive_preview"] = additive
+    return mat
+
+
+def effect_material_key(resolver, resource, texture_path, diffuse_frames=None, texture_animation=None):
+    return json.dumps(
+        (
+            str(resolver.root.resolve()).casefold(),
+            normalized_relpath(texture_path or "").casefold(),
+            resource.two_sided,
+            resource.src_blend,
+            resource.dst_blend,
+            resource.src_texture_arg1,
+            resource.src_texture_arg2,
+            resource.src_texture_op,
+            resource.dst_texture_arg1,
+            resource.dst_texture_arg2,
+            resource.dst_texture_op,
+            diffuse_frames or (),
+            texture_animation or (),
+        ),
+        separators=(",", ":"),
+    )
+
+
+def existing_effect_materials():
+    return {
+        material.get("silkroad_effect_material_key"): material
+        for material in bpy.data.materials
+        if material.get("silkroad_effect_material_key")
+    }
+
+
 def infer_material_path_for_mesh(mesh_path, material_name):
     parts = list(Path(mesh_path).parts)
     try:
@@ -1080,7 +1268,7 @@ def infer_material_path_for_mesh(mesh_path, material_name):
     return Path(*parts).with_name(f"{material_name}.bmt")
 
 
-def create_mesh_object(mesh_data, name, resolver, material_lookup, armature=None, collection=None, flip_uv=True, flip_winding=True, use_diffuse_alpha=True, roughness=1.0):
+def create_mesh_object(mesh_data, name, resolver, material_lookup, armature=None, collection=None, flip_uv=True, flip_winding=True, use_diffuse_alpha=True, roughness=1.0, material_override=None):
     positions = [sr_vec_to_blender(v.position) for v in mesh_data.vertices]
     vertex_count = len(positions)
     faces = []
@@ -1107,7 +1295,7 @@ def create_mesh_object(mesh_data, name, resolver, material_lookup, armature=None
     (collection or bpy.context.collection).objects.link(obj)
 
     material_info = material_lookup.get(mesh_data.material_name)
-    mat = make_material(mesh_data.material_name or name, resolver, material_info=material_info, alpha=use_diffuse_alpha, roughness=roughness)
+    mat = material_override or make_material(mesh_data.material_name or name, resolver, material_info=material_info, alpha=use_diffuse_alpha, roughness=roughness)
     obj.data.materials.append(mat)
 
     if mesh_data.bone_names:
@@ -1490,19 +1678,185 @@ def create_billboard_mesh(name, size=1.0):
     return mesh
 
 
+def normalize_flat_effect_mesh(obj, mesh_data):
+    """Normalize authored particle plates to the unit plate used by EasyFX.
+
+    Meshes such as up_pan.bms already contain a ~14x14 quad. Their ScaleGraph
+    values describe the final particle size, so multiplying both dimensions
+    makes backdrop plates tens of times larger than the rest of the effect.
+    """
+    if not mesh_data.vertices:
+        return
+    axes = list(zip(*(vertex.position for vertex in mesh_data.vertices)))
+    extents = [max(axis) - min(axis) for axis in axes]
+    largest = max(extents)
+    smallest = min(extents)
+    if largest <= 1.0001 or smallest > largest * 0.001:
+        return
+    unit_scale = 1.0 / largest
+    obj.scale = (unit_scale, unit_scale, unit_scale)
+    obj["silkroad_effect_native_plate_size"] = largest
+    obj["silkroad_effect_plate_normalized"] = True
+
+
 def iter_efp_resources(efp_object):
+    resources = []
     if efp_object.resource and efp_object.resource.meshes:
-        yield efp_object.resource
+        resources.append(efp_object.resource)
     for controller in efp_object.controllers:
         resource = controller.get("resource") if isinstance(controller, dict) else None
         if resource and resource.meshes:
-            yield resource
+            resources.append(resource)
+
+    # Shape controller data and the stored resource block commonly repeat the
+    # same plate. Importing both creates coplanar geometry (z-fighting/noise).
+    seen = set()
+    for resource in resources:
+        key = (
+            resource.two_sided,
+            resource.src_blend,
+            resource.dst_blend,
+            resource.src_texture_arg1,
+            resource.src_texture_arg2,
+            resource.src_texture_op,
+            resource.dst_texture_arg1,
+            resource.dst_texture_arg2,
+            resource.dst_texture_op,
+            tuple((mesh.path, tuple(mesh.textures)) for mesh in resource.meshes),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        yield resource
+
+
+def efp_object_sources(efp_object):
+    sources = []
+    sources.extend(efp_object.emitter_commands)
+    sources.extend(efp_object.program_commands)
+    sources.extend(efp_object.render_commands)
+    sources.extend((efp_object.lifetime_command, efp_object.view_command, efp_object.render_command))
+    for controller in efp_object.controllers:
+        sources.extend(controller.get("sources", []))
+    return [source for source in sources if source]
+
+
+def legacy_command_frame_count(source, max_life_frames):
+    """Reproduce EasyFX's CA0F40 frame-count calculation."""
+    if not isinstance(max_life_frames, int) or max_life_frames < 1:
+        return None
+    values = (source.start, source.end, source.span)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    start = max_life_frames * math.trunc(source.start / 100.0) if source.byte1 & 1 else math.trunc(source.start)
+    mode = source.byte1 >> 1
+    step = max_life_frames * source.end / 100.0 if mode & 1 else source.end
+    end_mode = (mode >> 1) % 5
+    if end_mode == 0:
+        end = math.trunc(source.span)
+    elif end_mode == 1:
+        end = max_life_frames * math.trunc(source.span / 100.0)
+    elif end_mode == 2:
+        end = start + math.trunc(source.span)
+    elif end_mode == 3:
+        end = start - max_life_frames * math.trunc(source.span / -100.0)
+    else:
+        if source.span < 1.0:
+            return None
+        end = start + math.trunc(source.span * step)
+    if end >= max_life_frames:
+        end = max_life_frames - 1
+    if end > max_life_frames or start > end or step < 0.000001:
+        return None
+    count = math.trunc((end - start) / step) + 1
+    return count if 0 < count <= 4096 else None
+
+
+def texture_slide_animation(efp_object):
+    """Resolve TextureSlide atlas metadata into discrete UV cells."""
+    # Render commands are the authoritative per-particle program. Controller
+    # copies often contain the same atlas declaration without resolved frames.
+    sources = list(efp_object.render_commands)
+    sources.extend(efp_object.program_commands)
+    sources.extend(efp_object.emitter_commands)
+    for controller in efp_object.controllers:
+        sources.extend(controller.get("sources", []))
+    for source in sources:
+        if not source or source.command != "TextureSlide" or not isinstance(source.value, dict):
+            continue
+        left = source.value.get("left")
+        if not left or len(left) < 3:
+            continue
+        columns = math.trunc(left[0])
+        rows = math.trunc(left[1])
+        step = left[2]
+        if not (1 <= columns <= 1024 and 1 <= rows <= 1024 and math.isfinite(step)):
+            continue
+        count = legacy_command_frame_count(source, efp_object.global_data_int)
+        if count is None:
+            count = len(source.value.get("frames", []))
+        if count < 1:
+            continue
+        cell_count = columns * rows
+        width = 1.0 / columns
+        height = 1.0 / rows
+        frames = []
+        for index in range(count):
+            frame_index = math.trunc(index * step) % cell_count
+            frames.append((
+                (frame_index % columns) / columns,
+                ((frame_index // columns) % rows) / rows,
+                width,
+                height,
+            ))
+        # Legacy TextureSlide encodes its command window as 50 ms ticks in
+        # span when span is above one; otherwise it uses ordinary seconds.
+        if source.span > source.start and source.span > 1.0 and source.end > 0.0:
+            start_ms = max(0.0, source.start * 50.0)
+            end_ms = max(start_ms + 50.0, source.span * 50.0)
+        else:
+            start_ms = max(0.0, source.start * 1000.0)
+            end_ms = max(start_ms + 50.0, source.end * 1000.0)
+        return {
+            "atlas": (columns, rows, step),
+            "frames": tuple(frames),
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "frame_ms": 50.0,
+        }
+    return None
 
 
 def source_frame_range(efp_object, fps):
-    start_ms = efp_object.int0 if efp_object.int0 > 0 else 0
-    end_ms = efp_object.int1 if efp_object.int1 > start_ms else max(1000, start_ms + 1000)
-    return frame_from_ms(start_ms, fps), frame_from_ms(end_ms, fps)
+    sources = efp_object_sources(efp_object)
+    ranges = [
+        (source.start, source.end)
+        for source in sources
+        if source and 0.0 <= source.start <= 600.0 and source.start < source.end <= 600.0
+    ]
+    texture_animation = texture_slide_animation(efp_object)
+    if texture_animation:
+        ranges.append((texture_animation["start_ms"] / 1000.0, texture_animation["end_ms"] / 1000.0))
+    if not ranges:
+        return frame_from_ms(0, fps), frame_from_ms(1000, fps)
+    return frame_from_ms(min(item[0] for item in ranges) * 1000.0, fps), frame_from_ms(max(item[1] for item in ranges) * 1000.0, fps)
+
+
+def effect_preview_timeline(root, fps):
+    ranges = []
+    stack = [root]
+    while stack:
+        efp_object = stack.pop()
+        stack.extend(efp_object.children)
+        if any(True for _ in iter_efp_resources(efp_object)):
+            ranges.append(source_frame_range(efp_object, fps))
+    if not ranges:
+        return 1, max(2, round(fps)), 1
+    start = max(1, math.floor(min(item[0] for item in ranges)))
+    end = max(start + 1, math.ceil(max(item[1] for item in ranges)))
+    candidates = sorted({start, end, *(round(value) for item in ranges for value in item)})
+    peak = max(candidates, key=lambda frame: (sum(left <= frame <= right for left, right in ranges), -frame))
+    return start, end, peak
 
 
 def animate_visibility(obj, start_frame, end_frame):
@@ -1522,7 +1876,162 @@ def animate_visibility(obj, start_frame, end_frame):
     obj.keyframe_insert("hide_render", frame=end_frame + 1)
 
 
-def apply_efp_commands(empty, efp_object, fps, scale):
+def sample_float_blend(blend, time_value):
+    points = sorted(blend.get("points", []), key=lambda item: item[0]) if isinstance(blend, dict) else []
+    if not points:
+        return 1.0
+    if time_value <= points[0][0]:
+        return points[0][1]
+    for index in range(1, len(points)):
+        right_time, right_value = points[index]
+        if time_value > right_time:
+            continue
+        left_time, left_value = points[index - 1]
+        span = right_time - left_time
+        if span <= 0.0:
+            return right_value
+        amount = (time_value - left_time) / span
+        return left_value + (right_value - left_value) * amount
+    return points[-1][1]
+
+
+def sample_tuple_blend(blend, time_value, default):
+    points = sorted(blend.get("points", []), key=lambda item: item[0]) if isinstance(blend, dict) else []
+    if not points:
+        return default
+    if time_value <= points[0][0]:
+        return points[0][1]
+    for index in range(1, len(points)):
+        right_time, right_value = points[index]
+        if time_value > right_time:
+            continue
+        left_time, left_value = points[index - 1]
+        span = right_time - left_time
+        if span <= 0.0:
+            return right_value
+        amount = (time_value - left_time) / span
+        return tuple(left + (right - left) * amount for left, right in zip(left_value, right_value))
+    return points[-1][1]
+
+
+def controller_scale_frames(efp_object):
+    for controller in efp_object.controllers:
+        if controller.get("name") != "ScaleGraph":
+            continue
+        axes = (controller.get("x", {}), controller.get("y", {}), controller.get("z", {}))
+        times = sorted({point[0] for axis in axes for point in axis.get("points", [])})
+        if not times:
+            continue
+        return [(time_value, tuple(sample_float_blend(axis, time_value) for axis in axes)) for time_value in times]
+    return []
+
+
+def controller_diffuse_frames(efp_object):
+    for controller in efp_object.controllers:
+        if controller.get("name") != "DiffuseGraph":
+            continue
+        alpha_blend = controller.get("byte", {})
+        color_blend = controller.get("color", {})
+        times = sorted({
+            point[0]
+            for blend in (alpha_blend, color_blend)
+            for point in blend.get("points", [])
+        })
+        if not times:
+            continue
+        frames = []
+        for time_value in times:
+            color = sample_tuple_blend(color_blend, time_value, (1.0, 1.0, 1.0, 1.0))
+            alpha_points = alpha_blend.get("points", [])
+            alpha_value = sample_float_blend(alpha_blend, time_value) if alpha_points else 255.0
+            alpha = max(0.0, min(1.0, alpha_value / 255.0))
+            frames.append((time_value, (color[0], color[1], color[2], 1.0), alpha))
+        return frames
+    return []
+
+
+def iter_action_fcurves(action):
+    """Yield F-curves from both legacy and Blender 4.4+/5 layered actions."""
+    seen = set()
+    for curve in getattr(action, "fcurves", ()):
+        if id(curve) not in seen:
+            seen.add(id(curve))
+            yield curve
+    for layer in getattr(action, "layers", ()):
+        for strip in getattr(layer, "strips", ()):
+            for channelbag in getattr(strip, "channelbags", ()):
+                for curve in getattr(channelbag, "fcurves", ()):
+                    if id(curve) not in seen:
+                        seen.add(id(curve))
+                        yield curve
+
+
+def animate_effect_materials(materials, efp_object, fps):
+    frames = controller_diffuse_frames(efp_object)
+    if frames:
+        start_frame, end_frame = source_frame_range(efp_object, fps)
+        first_time = frames[0][0]
+        last_time = frames[-1][0]
+        span = last_time - first_time
+        for material in materials:
+            tint = material.node_tree.nodes.get("Silkroad Effect Tint")
+            opacity = material.node_tree.nodes.get("Silkroad Effect Opacity")
+            if not tint or not opacity:
+                continue
+            for time_value, color, alpha in frames:
+                amount = (time_value - first_time) / span if span > 0.0 else 0.0
+                frame = start_frame + (end_frame - start_frame) * amount
+                tint.inputs[2].default_value = color
+                tint.inputs[2].keyframe_insert("default_value", frame=frame)
+                opacity.inputs[1].default_value = alpha
+                opacity.inputs[1].keyframe_insert("default_value", frame=frame)
+
+    texture_animation = texture_slide_animation(efp_object)
+    if not texture_animation:
+        return
+    atlas_frames = texture_animation["frames"]
+    start_ms = texture_animation["start_ms"]
+    end_ms = texture_animation["end_ms"]
+    frame_ms = texture_animation["frame_ms"]
+    key_count = max(1, math.ceil((end_ms - start_ms) / frame_ms))
+    for material in materials:
+        uv_scale = material.node_tree.nodes.get("Silkroad Effect UV Scale")
+        uv_offset = material.node_tree.nodes.get("Silkroad Effect UV Offset")
+        tex_node = next((node for node in material.node_tree.nodes if node.type == "TEX_IMAGE"), None)
+        if not uv_scale or not uv_offset:
+            continue
+        image = tex_node.image if tex_node else None
+        for index in range(key_count + 1):
+            atlas_frame = atlas_frames[index % len(atlas_frames)]
+            scale, offset = atlas_uv_transform(atlas_frame, image)
+            timeline_frame = frame_from_ms(min(end_ms, start_ms + index * frame_ms), fps)
+            uv_scale.inputs[1].default_value = scale
+            uv_scale.inputs[1].keyframe_insert("default_value", frame=timeline_frame)
+            uv_offset.inputs[1].default_value = offset
+            uv_offset.inputs[1].keyframe_insert("default_value", frame=timeline_frame)
+        action = material.node_tree.animation_data.action if material.node_tree.animation_data else None
+        if action:
+            for curve in iter_action_fcurves(action):
+                if "Silkroad Effect UV " not in curve.data_path:
+                    continue
+                for point in curve.keyframe_points:
+                    point.interpolation = "CONSTANT"
+        material["silkroad_texture_frame_count"] = len(atlas_frames)
+        material["silkroad_texture_frame_ms"] = frame_ms
+
+
+def apply_efp_commands(transform, scale_target, efp_object, fps):
+    controller_frames = controller_scale_frames(efp_object)
+    if controller_frames:
+        start_frame, end_frame = source_frame_range(efp_object, fps)
+        first_time = controller_frames[0][0]
+        last_time = controller_frames[-1][0]
+        span = last_time - first_time
+        for time_value, vec in controller_frames:
+            amount = (time_value - first_time) / span if span > 0.0 else 0.0
+            scale_target.scale = sr_scale_to_blender(vec)
+            scale_target.keyframe_insert("scale", frame=start_frame + (end_frame - start_frame) * amount)
+
     commands = []
     commands.extend(efp_object.emitter_commands)
     commands.extend(efp_object.program_commands)
@@ -1532,7 +2041,7 @@ def apply_efp_commands(empty, efp_object, fps, scale):
 
     for source in commands:
         if source.command == "SetPosition" and source.value:
-            empty.location = sr_vec_to_blender(source.value) * scale
+            transform.location = sr_vec_to_blender(source.value)
         elif source.command == "SetBANPos" and isinstance(source.value, dict):
             frames = source.value.get("frames", [])
             if frames:
@@ -1540,93 +2049,152 @@ def apply_efp_commands(empty, efp_object, fps, scale):
                 end = frame_from_ms(source.end * 1000.0, fps) if source.end > source.start else start + len(frames)
                 step = (end - start) / max(1, len(frames) - 1)
                 for index, vec in enumerate(frames):
-                    empty.location = sr_vec_to_blender(vec) * scale
-                    empty.keyframe_insert("location", frame=start + step * index)
+                    transform.location = sr_vec_to_blender(vec)
+                    transform.keyframe_insert("location", frame=start + step * index)
         elif source.command == "SetBANRot" and isinstance(source.value, dict):
             frames = source.value.get("frames", [])
             if frames:
-                empty.rotation_mode = "QUATERNION"
+                transform.rotation_mode = "QUATERNION"
                 start = frame_from_ms(source.start * 1000.0, fps)
                 step = 1.0
                 for index, mat in enumerate(frames):
                     converted = sr_object_matrix_to_blender(mat)
-                    empty.rotation_quaternion = converted.to_quaternion()
-                    empty.keyframe_insert("rotation_quaternion", frame=start + step * index)
+                    transform.rotation_quaternion = converted.to_quaternion()
+                    transform.keyframe_insert("rotation_quaternion", frame=start + step * index)
         elif source.command == "SetRotationMat" and source.value:
-            empty.rotation_mode = "QUATERNION"
-            empty.rotation_quaternion = sr_object_matrix_to_blender(source.value).to_quaternion()
+            transform.rotation_mode = "QUATERNION"
+            transform.rotation_quaternion = sr_object_matrix_to_blender(source.value).to_quaternion()
         elif source.command in {"SetRotation", "SetRotationAxis"} and isinstance(source.value, dict):
             mat = source.value.get("matrix")
             if mat is not None:
-                empty.rotation_mode = "QUATERNION"
-                empty.rotation_quaternion = sr_object_matrix_to_blender(mat).to_quaternion()
+                transform.rotation_mode = "QUATERNION"
+                transform.rotation_quaternion = sr_object_matrix_to_blender(mat).to_quaternion()
         elif source.command in {"SetRVelocityMat", "SetRVelocity", "SetRVelocityAxis", "SetShapeRot", "SetShapeRotVel"}:
-            empty["silkroad_ignored_internal_rotation"] = source.command
+            transform["silkroad_ignored_internal_rotation"] = source.command
         elif source.command == "SetGraphScale" and isinstance(source.value, list) and source.value:
             start = frame_from_ms(source.start * 1000.0, fps)
             end = frame_from_ms(source.end * 1000.0, fps) if source.end > source.start else start + len(source.value)
             step = (end - start) / max(1, len(source.value) - 1)
             for index, vec in enumerate(source.value):
-                empty.scale = sr_scale_to_blender(vec, scale)
-                empty.keyframe_insert("scale", frame=start + step * index)
+                scale_target.scale = sr_scale_to_blender(vec)
+                scale_target.keyframe_insert("scale", frame=start + step * index)
 
 
-def import_efp_object(context, resolver, efp_object, collection, parent=None, fps=30, effect_scale=1.0, depth=0):
+def import_efp_object(context, resolver, efp_object, collection, parent=None, fps=30, depth=0, material_cache=None):
+    if material_cache is None:
+        material_cache = existing_effect_materials()
     empty = bpy.data.objects.new(safe_name(efp_object.name or f"EFP_{depth}"), None)
-    empty.empty_display_type = "SPHERE"
-    empty.empty_display_size = 0.25 * effect_scale
+    empty.empty_display_type = "PLAIN_AXES"
+    empty.empty_display_size = 0.08
     collection.objects.link(empty)
     if parent:
         empty.parent = parent
-    apply_efp_commands(empty, efp_object, fps, effect_scale)
+
+    visual_scale = bpy.data.objects.new(f"{empty.name}_VisualScale", None)
+    visual_scale.empty_display_type = "PLAIN_AXES"
+    visual_scale.empty_display_size = 0.04
+    visual_scale.parent = empty
+    collection.objects.link(visual_scale)
+    apply_efp_commands(empty, visual_scale, efp_object, fps)
 
     start_frame, end_frame = source_frame_range(efp_object, fps)
-    animate_visibility(empty, start_frame, end_frame)
 
-    material_cache = {}
+    object_materials = set()
+    diffuse_signature = tuple(controller_diffuse_frames(efp_object))
+    texture_animation = texture_slide_animation(efp_object)
     for resource in iter_efp_resources(efp_object):
         for mesh_ref in resource.meshes:
             mesh_path = resolver.resolve(mesh_ref.path, prefer="Particles")
             textures = [tex for tex in mesh_ref.textures if not is_none_path(tex)]
             texture = textures[0] if textures else ""
-            mat_key = texture or mesh_ref.path or efp_object.name
+            mat_label = texture or mesh_ref.path or efp_object.name
+            mat_key = effect_material_key(resolver, resource, texture, diffuse_signature, texture_animation)
             mat = material_cache.get(mat_key)
             if not mat:
-                mat = make_material(f"{empty.name}_{Path(mat_key).stem}", resolver, texture_path=texture, base_color=(1, 1, 1, 0.65), alpha=True)
+                material_name = f"SROFX_{Path(mat_label).stem}_{resource.src_blend}_{resource.dst_blend}"
+                mat = make_effect_material(
+                    material_name,
+                    resolver,
+                    resource,
+                    texture_path=texture,
+                    texture_animation=texture_animation,
+                )
+                mat["silkroad_effect_material_key"] = mat_key
                 material_cache[mat_key] = mat
+            object_materials.add(mat)
 
             if mesh_path and mesh_path.suffix.lower() == ".bms":
                 try:
                     mesh_data = parse_bms(mesh_path)
-                    obj = create_mesh_object(mesh_data, f"{empty.name}_{mesh_data.name}", resolver, {}, None, collection, True, True)
-                    obj.data.materials.clear()
-                    obj.data.materials.append(mat)
-                except Exception:
-                    obj = bpy.data.objects.new(f"{empty.name}_plate", create_billboard_mesh(f"{empty.name}_plate", effect_scale))
+                    obj = create_mesh_object(
+                        mesh_data,
+                        f"{empty.name}_{mesh_data.name}",
+                        resolver,
+                        {},
+                        None,
+                        collection,
+                        True,
+                        True,
+                        material_override=mat,
+                    )
+                    normalize_flat_effect_mesh(obj, mesh_data)
+                except Exception as exc:
+                    print(f"Silkroad importer: EFP mesh failed {mesh_path}: {exc}")
+                    obj = bpy.data.objects.new(f"{empty.name}_plate", create_billboard_mesh(f"{empty.name}_plate"))
                     collection.objects.link(obj)
                     obj.data.materials.append(mat)
             else:
-                obj = bpy.data.objects.new(f"{empty.name}_plate", create_billboard_mesh(f"{empty.name}_plate", effect_scale))
+                obj = bpy.data.objects.new(f"{empty.name}_plate", create_billboard_mesh(f"{empty.name}_plate"))
                 collection.objects.link(obj)
                 obj.data.materials.append(mat)
 
-            obj.parent = empty
+            obj.parent = visual_scale
+            obj["silkroad_effect_texture"] = texture
+            obj["silkroad_effect_mesh"] = mesh_ref.path
             animate_visibility(obj, start_frame, end_frame)
 
+    animate_effect_materials(object_materials, efp_object, fps)
+
     for child in efp_object.children:
-        import_efp_object(context, resolver, child, collection, empty, fps, effect_scale, depth + 1)
+        # A node's animated particle scale affects its own renderable only.
+        # Child nodes inherit position/rotation, not the parent's particle
+        # scale (matching the Three.js EasyFX runtime).
+        import_efp_object(context, resolver, child, collection, empty, fps, depth + 1, material_cache)
     return empty
 
 
 def import_efp_to_scene(context, efp_path, game_root, parent=None, effect_scale=1.0, parent_collection=None, collection_name=None):
-    resolver = AssetResolver(game_root)
+    efp_path = Path(efp_path)
+    particles_dir = next((p for p in (efp_path.parent, *efp_path.parents) if p.name.casefold() == "particles"), None)
+    resolver = AssetResolver(particles_dir.parent if particles_dir else game_root)
     effect = parse_efp(efp_path)
     collection = bpy.data.collections.new(collection_name or ("EFP_" + safe_name(effect.path.stem)))
     (parent_collection or context.scene.collection).children.link(collection)
     fps = context.scene.render.fps or 30
-    root = import_efp_object(context, resolver, effect.root, collection, parent, fps, effect.scale * effect_scale)
-    root["silkroad_efp_path"] = str(efp_path)
-    return root, effect
+    timeline_start, timeline_end, preview_frame = effect_preview_timeline(effect.root, fps)
+    preview_root = bpy.data.objects.new("EFP_Preview_" + safe_name(effect.path.stem), None)
+    preview_root.empty_display_type = "PLAIN_AXES"
+    preview_root.empty_display_size = 0.12
+    preview_root.scale = (effect.scale * effect_scale,) * 3
+    preview_root["silkroad_efp_path"] = str(efp_path)
+    preview_root["silkroad_effect_file_scale"] = effect.scale
+    collection.objects.link(preview_root)
+    if parent:
+        preview_root.parent = parent
+    material_cache = existing_effect_materials()
+    import_efp_object(context, resolver, effect.root, collection, preview_root, fps, material_cache=material_cache)
+
+    # animate_visibility finishes while objects are on their last (hidden)
+    # key. Re-evaluate the current frame so imported parts immediately match
+    # the timeline instead of appearing to be missing.
+    if parent is None:
+        context.scene.frame_start = timeline_start
+        context.scene.frame_end = timeline_end
+        current_frame = preview_frame
+    else:
+        current_frame = context.scene.frame_current
+    context.scene.frame_set(current_frame)
+    return preview_root, effect
 
 
 def parse_csv_floats(value, size=3, default=None):
@@ -2805,16 +3373,15 @@ class SILKROAD_OT_attach_selected_item(Operator):
 class SILKROAD_OT_import_efp(Operator, ImportHelper):
     bl_idname = "silkroad.import_efp"
     bl_label = "Import EFP Effect"
-    bl_description = "Import a Silkroad .efp visual effect as animated Blender proxy objects"
+    bl_description = "Import a standalone Silkroad .efp visual preview (no character/weapon attach)"
     filename_ext = ".efp"
     filter_glob: StringProperty(default="*.efp", options={"HIDDEN"})
 
     def execute(self, context):
         props = context.scene.silkroad_importer
-        parent = active_armature(context) or props.target_armature
         try:
-            import_efp_to_scene(context, self.filepath, props.game_root, parent=parent, effect_scale=props.effect_scale)
-            self.report({"INFO"}, "Effect imported")
+            import_efp_to_scene(context, self.filepath, props.game_root, parent=None, effect_scale=props.effect_scale)
+            self.report({"INFO"}, "Standalone effect preview imported")
             return {"FINISHED"}
         except Exception as exc:
             traceback.print_exc()
