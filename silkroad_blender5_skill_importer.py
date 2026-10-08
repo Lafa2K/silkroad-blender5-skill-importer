@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Silkroad Skill/VFX Importer",
     "author": "Codex",
-    "version": (0, 2, 3),
+    "version": (0, 2, 4),
     "blender": (5, 0, 0),
     "location": "View3D Sidebar > Silkroad",
     "description": "Imports Silkroad Online BSR/BMS/BSK/BAN assets and EFP skill effects.",
@@ -1096,10 +1096,13 @@ def set_effect_surface_blending(mat):
 
 
 def atlas_uv_transform(frame, image=None):
-    """Convert EasyFX top-left atlas coordinates to Blender UV transform."""
+    """Convert an EasyFX atlas cell to the Blender material UV transform."""
     u, v, width, height = frame
     offset_u = u
-    offset_v = 1.0 - v - height
+    # Effect meshes already flip V while their UV layer is created. Applying
+    # the top-left -> bottom-left conversion again shifts a 4x2 atlas by 0.5
+    # and selects the opposite row.
+    offset_v = v
     scale_u = width
     scale_v = height
     if image and image.size[0] > 0 and image.size[1] > 0:
