@@ -1247,6 +1247,7 @@ def effect_material_key(resolver, resource, texture_path, diffuse_frames=None, t
             resource.dst_texture_arg2,
             resource.dst_texture_op,
             diffuse_frames or (),
+            "atlas-uv-v2" if texture_animation else "",
             texture_animation or (),
         ),
         separators=(",", ":"),
