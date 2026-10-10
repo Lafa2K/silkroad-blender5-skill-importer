@@ -15,6 +15,8 @@ The importer is focused on research and visualization. It does not include any S
 - Imports visual `.efp` effects as Blender proxy objects.
 - Replays EasyFX `TextureSlide` spritesheets from the UV frames stored in the
   EFP, including repeated/custom frame order and Blender's vertical UV conversion.
+- Creates an inspectable `SilkroadSpriteUV` layer mapped to the first atlas cell,
+  then animates cell changes without leaving the full spritesheet across the mesh.
 - Supports character and weapon presets through a local JSON config.
 - Attaches weapons/items to character bones such as `Bip01 R Hand`.
 - Uses diffuse texture alpha by default for imported model materials and exposes a roughness control (default `1.0`). In Blender 5, alpha materials use the Dithered render method.

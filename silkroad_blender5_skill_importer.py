@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Silkroad Skill/VFX Importer",
     "author": "Codex",
-    "version": (0, 2, 5),
+    "version": (0, 2, 6),
     "blender": (5, 0, 0),
     "location": "View3D Sidebar > Silkroad",
     "description": "Imports Silkroad Online BSR/BMS/BSK/BAN assets and EFP skill effects.",
@@ -1106,16 +1106,33 @@ def atlas_uv_transform(frame, image=None):
     offset_v = 1.0 - v - height
     scale_u = width
     scale_v = height
-    if image and image.size[0] > 0 and image.size[1] > 0:
-        # Keep bilinear sampling half a texel inside the selected cell so the
-        # neighboring sprite cannot bleed into the flame at tile boundaries.
-        pad_u = 0.5 / float(image.size[0])
-        pad_v = 0.5 / float(image.size[1])
-        offset_u += pad_u
-        offset_v += pad_v
-        scale_u = max(0.0001, scale_u - (2.0 * pad_u))
-        scale_v = max(0.0001, scale_v - (2.0 * pad_v))
     return (scale_u, scale_v, 1.0), (offset_u, offset_v, 0.0)
+
+
+def create_sprite_uv_map(obj, frame):
+    """Bake the first EasyFX atlas cell into an inspectable Blender UV map."""
+    mesh = getattr(obj, "data", None)
+    uv_layers = getattr(mesh, "uv_layers", None)
+    if not uv_layers or not uv_layers.active:
+        return False
+
+    source = uv_layers.active
+    target = uv_layers.get("SilkroadSpriteUV") or uv_layers.new(name="SilkroadSpriteUV")
+    scale, offset = atlas_uv_transform(frame)
+    for loop_index, source_uv in enumerate(source.data):
+        u, v = source_uv.uv
+        target.data[loop_index].uv = (
+            u * scale[0] + offset[0],
+            v * scale[1] + offset[1],
+        )
+    uv_layers.active = target
+    try:
+        target.active_render = True
+    except (AttributeError, TypeError):
+        pass
+    obj["silkroad_sprite_uv"] = target.name
+    obj["silkroad_sprite_first_frame"] = tuple(frame)
+    return True
 
 
 def make_effect_material(name, resolver, resource, texture_path=None, texture_animation=None):
@@ -1185,17 +1202,28 @@ def make_effect_material(name, resolver, resource, texture_path=None, texture_an
             tex_node.interpolation = "Linear"
             if texture_animation and texture_animation.get("frames"):
                 tex_node.extension = "CLIP"
-                texcoord = nodes.new(type="ShaderNodeTexCoord")
+                texcoord = nodes.new(type="ShaderNodeUVMap")
+                texcoord.uv_map = "SilkroadSpriteUV"
+                uv_origin = nodes.new(type="ShaderNodeVectorMath")
+                uv_normalize = nodes.new(type="ShaderNodeVectorMath")
                 uv_scale = nodes.new(type="ShaderNodeVectorMath")
                 uv_offset = nodes.new(type="ShaderNodeVectorMath")
+                uv_origin.operation = "SUBTRACT"
+                uv_normalize.operation = "DIVIDE"
                 uv_scale.operation = "MULTIPLY"
                 uv_offset.operation = "ADD"
+                uv_origin.name = "Silkroad Effect UV Base Offset"
+                uv_normalize.name = "Silkroad Effect UV Base Scale"
                 uv_scale.name = "Silkroad Effect UV Scale"
                 uv_offset.name = "Silkroad Effect UV Offset"
                 scale, offset = atlas_uv_transform(texture_animation["frames"][0], image)
+                uv_origin.inputs[1].default_value = offset
+                uv_normalize.inputs[1].default_value = scale
                 uv_scale.inputs[1].default_value = scale
                 uv_offset.inputs[1].default_value = offset
-                links.new(texcoord.outputs["UV"], uv_scale.inputs[0])
+                links.new(texcoord.outputs["UV"], uv_origin.inputs[0])
+                links.new(uv_origin.outputs[0], uv_normalize.inputs[0])
+                links.new(uv_normalize.outputs[0], uv_scale.inputs[0])
                 links.new(uv_scale.outputs[0], uv_offset.inputs[0])
                 links.new(uv_offset.outputs[0], tex_node.inputs["Vector"])
             links.new(tex_node.outputs["Color"], tint.inputs[1])
@@ -1248,7 +1276,7 @@ def effect_material_key(resolver, resource, texture_path, diffuse_frames=None, t
             resource.dst_texture_arg2,
             resource.dst_texture_op,
             diffuse_frames or (),
-            "atlas-uv-v3" if texture_animation else "",
+            "atlas-uv-v4" if texture_animation else "",
             texture_animation or (),
         ),
         separators=(",", ":"),
@@ -2171,6 +2199,9 @@ def import_efp_object(context, resolver, efp_object, collection, parent=None, fp
                 obj = bpy.data.objects.new(f"{empty.name}_plate", create_billboard_mesh(f"{empty.name}_plate"))
                 collection.objects.link(obj)
                 obj.data.materials.append(mat)
+
+            if texture_animation and texture_animation.get("frames"):
+                create_sprite_uv_map(obj, texture_animation["frames"][0])
 
             obj.parent = visual_scale
             obj["silkroad_effect_texture"] = texture
