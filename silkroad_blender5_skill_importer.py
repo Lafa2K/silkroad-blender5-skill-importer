@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Silkroad Skill/VFX Importer",
     "author": "Codex",
-    "version": (0, 2, 6),
+    "version": (0, 2, 7),
     "blender": (5, 0, 0),
     "location": "View3D Sidebar > Silkroad",
     "description": "Imports Silkroad Online BSR/BMS/BSK/BAN assets and EFP skill effects.",
@@ -1109,30 +1109,16 @@ def atlas_uv_transform(frame, image=None):
     return (scale_u, scale_v, 1.0), (offset_u, offset_v, 0.0)
 
 
-def create_sprite_uv_map(obj, frame):
-    """Bake the first EasyFX atlas cell into an inspectable Blender UV map."""
-    mesh = getattr(obj, "data", None)
-    uv_layers = getattr(mesh, "uv_layers", None)
-    if not uv_layers or not uv_layers.active:
-        return False
-
-    source = uv_layers.active
-    target = uv_layers.get("SilkroadSpriteUV") or uv_layers.new(name="SilkroadSpriteUV")
-    scale, offset = atlas_uv_transform(frame)
-    for loop_index, source_uv in enumerate(source.data):
-        u, v = source_uv.uv
-        target.data[loop_index].uv = (
-            u * scale[0] + offset[0],
-            v * scale[1] + offset[1],
-        )
-    uv_layers.active = target
-    try:
-        target.active_render = True
-    except (AttributeError, TypeError):
-        pass
-    obj["silkroad_sprite_uv"] = target.name
-    obj["silkroad_sprite_first_frame"] = tuple(frame)
-    return True
+def procedural_atlas_frame(columns, rows, speed, life):
+    """Select one TextureSlide cell from normalized particle life."""
+    cell_count = columns * rows
+    frame_index = math.floor(max(0.0, life) * cell_count * speed) % cell_count
+    return (
+        (frame_index % columns) / columns,
+        (frame_index // columns) / rows,
+        1.0 / columns,
+        1.0 / rows,
+    )
 
 
 def make_effect_material(name, resolver, resource, texture_path=None, texture_animation=None):
@@ -1203,27 +1189,17 @@ def make_effect_material(name, resolver, resource, texture_path=None, texture_an
             if texture_animation and texture_animation.get("frames"):
                 tex_node.extension = "CLIP"
                 texcoord = nodes.new(type="ShaderNodeUVMap")
-                texcoord.uv_map = "SilkroadSpriteUV"
-                uv_origin = nodes.new(type="ShaderNodeVectorMath")
-                uv_normalize = nodes.new(type="ShaderNodeVectorMath")
+                texcoord.uv_map = "UVMap"
                 uv_scale = nodes.new(type="ShaderNodeVectorMath")
                 uv_offset = nodes.new(type="ShaderNodeVectorMath")
-                uv_origin.operation = "SUBTRACT"
-                uv_normalize.operation = "DIVIDE"
                 uv_scale.operation = "MULTIPLY"
                 uv_offset.operation = "ADD"
-                uv_origin.name = "Silkroad Effect UV Base Offset"
-                uv_normalize.name = "Silkroad Effect UV Base Scale"
                 uv_scale.name = "Silkroad Effect UV Scale"
                 uv_offset.name = "Silkroad Effect UV Offset"
                 scale, offset = atlas_uv_transform(texture_animation["frames"][0], image)
-                uv_origin.inputs[1].default_value = offset
-                uv_normalize.inputs[1].default_value = scale
                 uv_scale.inputs[1].default_value = scale
                 uv_offset.inputs[1].default_value = offset
-                links.new(texcoord.outputs["UV"], uv_origin.inputs[0])
-                links.new(uv_origin.outputs[0], uv_normalize.inputs[0])
-                links.new(uv_normalize.outputs[0], uv_scale.inputs[0])
+                links.new(texcoord.outputs["UV"], uv_scale.inputs[0])
                 links.new(uv_scale.outputs[0], uv_offset.inputs[0])
                 links.new(uv_offset.outputs[0], tex_node.inputs["Vector"])
             links.new(tex_node.outputs["Color"], tint.inputs[1])
@@ -1276,7 +1252,7 @@ def effect_material_key(resolver, resource, texture_path, diffuse_frames=None, t
             resource.dst_texture_arg2,
             resource.dst_texture_op,
             diffuse_frames or (),
-            "atlas-uv-v4" if texture_animation else "",
+            "atlas-uv-v5" if texture_animation else "",
             texture_animation or (),
         ),
         separators=(",", ":"),
@@ -1774,39 +1750,8 @@ def efp_object_sources(efp_object):
     return [source for source in sources if source]
 
 
-def legacy_command_frame_count(source, max_life_frames):
-    """Reproduce EasyFX's CA0F40 frame-count calculation."""
-    if not isinstance(max_life_frames, int) or max_life_frames < 1:
-        return None
-    values = (source.start, source.end, source.span)
-    if not all(math.isfinite(value) for value in values):
-        return None
-    start = max_life_frames * math.trunc(source.start / 100.0) if source.byte1 & 1 else math.trunc(source.start)
-    mode = source.byte1 >> 1
-    step = max_life_frames * source.end / 100.0 if mode & 1 else source.end
-    end_mode = (mode >> 1) % 5
-    if end_mode == 0:
-        end = math.trunc(source.span)
-    elif end_mode == 1:
-        end = max_life_frames * math.trunc(source.span / 100.0)
-    elif end_mode == 2:
-        end = start + math.trunc(source.span)
-    elif end_mode == 3:
-        end = start - max_life_frames * math.trunc(source.span / -100.0)
-    else:
-        if source.span < 1.0:
-            return None
-        end = start + math.trunc(source.span * step)
-    if end >= max_life_frames:
-        end = max_life_frames - 1
-    if end > max_life_frames or start > end or step < 0.000001:
-        return None
-    count = math.trunc((end - start) / step) + 1
-    return count if 0 < count <= 4096 else None
-
-
 def texture_slide_animation(efp_object):
-    """Resolve TextureSlide atlas metadata into discrete UV cells."""
+    """Resolve TextureSlide without confusing command ticks with atlas cells."""
     # Render commands are the authoritative per-particle program. Controller
     # copies often contain the same atlas declaration without resolved frames.
     sources = list(efp_object.render_commands)
@@ -1826,11 +1771,6 @@ def texture_slide_animation(efp_object):
         if not (1 <= columns <= 1024 and 1 <= rows <= 1024 and math.isfinite(step)):
             continue
         stored_frames = source.value.get("frames", [])
-        count = legacy_command_frame_count(source, efp_object.global_data_int)
-        if count is None:
-            count = len(stored_frames)
-        if count < 1:
-            continue
         cell_count = columns * rows
         width = 1.0 / columns
         height = 1.0 / rows
@@ -1848,33 +1788,24 @@ def texture_slide_animation(efp_object):
                 continue
             frames.append((u, v, frame_width, frame_height))
 
-        if frames:
-            frames = frames[:count]
-        else:
-            for index in range(count):
-                frame_index = math.trunc(index * step) % cell_count
-                frames.append((
-                    (frame_index % columns) / columns,
-                    ((frame_index // columns) % rows) / rows,
-                    width,
-                    height,
-                ))
-        if not frames:
-            continue
-        # Legacy TextureSlide encodes its command window as 50 ms ticks in
-        # span when span is above one; otherwise it uses ordinary seconds.
-        if source.span > source.start and source.span > 1.0 and source.end > 0.0:
-            start_ms = max(0.0, source.start * 50.0)
-            end_ms = max(start_ms + 50.0, source.span * 50.0)
-        else:
-            start_ms = max(0.0, source.start * 1000.0)
-            end_ms = max(start_ms + 50.0, source.end * 1000.0)
+        procedural = not frames
+        if procedural:
+            # X/Y are the atlas grid and Z is the normalized-life speed.  The
+            # command's Float2/span is a legacy scheduling value, not seconds
+            # and not a texture-frame count.  Keep one initial frame here;
+            # animate_effect_materials samples the procedural cell per scene
+            # frame so a 4x3 atlas can never turn into 120 UV cells.
+            frames = [(0.0, 0.0, width, height)]
+
+        start_ms = max(0.0, source.start * 1000.0)
+        end_ms = max(start_ms + 1.0, source.end * 1000.0)
         return {
             "atlas": (columns, rows, step),
             "frames": tuple(frames),
+            "procedural": procedural,
+            "cell_count": cell_count,
             "start_ms": start_ms,
             "end_ms": end_ms,
-            "frame_ms": 50.0,
         }
     return None
 
@@ -2044,8 +1975,13 @@ def animate_effect_materials(materials, efp_object, fps):
     atlas_frames = texture_animation["frames"]
     start_ms = texture_animation["start_ms"]
     end_ms = texture_animation["end_ms"]
-    frame_ms = texture_animation["frame_ms"]
-    key_count = max(1, math.ceil((end_ms - start_ms) / frame_ms))
+    columns, rows, speed = texture_animation["atlas"]
+    cell_count = texture_animation["cell_count"]
+    procedural = texture_animation["procedural"]
+    start_frame = frame_from_ms(start_ms, fps)
+    end_frame = max(start_frame + 1.0, frame_from_ms(end_ms, fps))
+    first_key = math.floor(start_frame)
+    last_key = math.ceil(end_frame)
     for material in materials:
         uv_scale = material.node_tree.nodes.get("Silkroad Effect UV Scale")
         uv_offset = material.node_tree.nodes.get("Silkroad Effect UV Offset")
@@ -2053,10 +1989,17 @@ def animate_effect_materials(materials, efp_object, fps):
         if not uv_scale or not uv_offset:
             continue
         image = tex_node.image if tex_node else None
-        for index in range(key_count + 1):
-            atlas_frame = atlas_frames[index % len(atlas_frames)]
+        for timeline_frame in range(first_key, last_key + 1):
+            if timeline_frame >= last_key:
+                life = 0.0
+            else:
+                life = max(0.0, min(1.0, (timeline_frame - start_frame) / (end_frame - start_frame)))
+            if procedural:
+                atlas_frame = procedural_atlas_frame(columns, rows, speed, life)
+            else:
+                frame_index = math.floor(life * len(atlas_frames)) % len(atlas_frames)
+                atlas_frame = atlas_frames[frame_index]
             scale, offset = atlas_uv_transform(atlas_frame, image)
-            timeline_frame = frame_from_ms(min(end_ms, start_ms + index * frame_ms), fps)
             uv_scale.inputs[1].default_value = scale
             uv_scale.inputs[1].keyframe_insert("default_value", frame=timeline_frame)
             uv_offset.inputs[1].default_value = offset
@@ -2068,8 +2011,11 @@ def animate_effect_materials(materials, efp_object, fps):
                     continue
                 for point in curve.keyframe_points:
                     point.interpolation = "CONSTANT"
-        material["silkroad_texture_frame_count"] = len(atlas_frames)
-        material["silkroad_texture_frame_ms"] = frame_ms
+                if not any(modifier.type == "CYCLES" for modifier in curve.modifiers):
+                    curve.modifiers.new("CYCLES")
+        material["silkroad_texture_frame_count"] = cell_count if procedural else len(atlas_frames)
+        material["silkroad_texture_cycle_ms"] = end_ms - start_ms
+        material["silkroad_texture_speed"] = speed
 
 
 def apply_efp_commands(transform, scale_target, efp_object, fps):
@@ -2199,9 +2145,6 @@ def import_efp_object(context, resolver, efp_object, collection, parent=None, fp
                 obj = bpy.data.objects.new(f"{empty.name}_plate", create_billboard_mesh(f"{empty.name}_plate"))
                 collection.objects.link(obj)
                 obj.data.materials.append(mat)
-
-            if texture_animation and texture_animation.get("frames"):
-                create_sprite_uv_map(obj, texture_animation["frames"][0])
 
             obj.parent = visual_scale
             obj["silkroad_effect_texture"] = texture

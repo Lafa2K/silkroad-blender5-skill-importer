@@ -13,10 +13,10 @@ The importer is focused on research and visualization. It does not include any S
 - Plays skills from `Media/server_dep/silkroad/textdata/skilleffect.txt`.
 - Applies matching character `.ban` animations when the selected character supports the skill animation group.
 - Imports visual `.efp` effects as Blender proxy objects.
-- Replays EasyFX `TextureSlide` spritesheets from the UV frames stored in the
-  EFP, including repeated/custom frame order and Blender's vertical UV conversion.
-- Creates an inspectable `SilkroadSpriteUV` layer mapped to the first atlas cell,
-  then animates cell changes without leaving the full spritesheet across the mesh.
+- Replays EasyFX `TextureSlide` spritesheets from authored UV frames when
+  present, or from the procedural grid and speed stored in the EFP when empty.
+- Keeps the authored `UVMap` intact and selects atlas cells in the material,
+  using the TextureSlide grid, normalized-life speed, and command window.
 - Supports character and weapon presets through a local JSON config.
 - Attaches weapons/items to character bones such as `Bip01 R Hand`.
 - Uses diffuse texture alpha by default for imported model materials and exposes a roughness control (default `1.0`). In Blender 5, alpha materials use the Dithered render method.
