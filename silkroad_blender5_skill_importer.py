@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Silkroad Skill/VFX Importer",
     "author": "Codex",
-    "version": (0, 2, 4),
+    "version": (0, 2, 5),
     "blender": (5, 0, 0),
     "location": "View3D Sidebar > Silkroad",
     "description": "Imports Silkroad Online BSR/BMS/BSK/BAN assets and EFP skill effects.",
@@ -1096,13 +1096,14 @@ def set_effect_surface_blending(mat):
 
 
 def atlas_uv_transform(frame, image=None):
-    """Convert an EasyFX atlas cell to the Blender material UV transform."""
+    """Convert an EasyFX/D3D top-left atlas cell to Blender UV space."""
     u, v, width, height = frame
     offset_u = u
-    # Effect meshes already flip V while their UV layer is created. Applying
-    # the top-left -> bottom-left conversion again shifts a 4x2 atlas by 0.5
-    # and selects the opposite row.
-    offset_v = v
+    # EasyFX stores the atlas origin at the top left.  The mesh V coordinate is
+    # flipped when it enters Blender, but the *cell offset* still needs its own
+    # top-left -> bottom-left conversion.  Omitting this moves a 4x2 atlas by
+    # exactly half the texture and selects the opposite row.
+    offset_v = 1.0 - v - height
     scale_u = width
     scale_v = height
     if image and image.size[0] > 0 and image.size[1] > 0:
@@ -1247,7 +1248,7 @@ def effect_material_key(resolver, resource, texture_path, diffuse_frames=None, t
             resource.dst_texture_arg2,
             resource.dst_texture_op,
             diffuse_frames or (),
-            "atlas-uv-v2" if texture_animation else "",
+            "atlas-uv-v3" if texture_animation else "",
             texture_animation or (),
         ),
         separators=(",", ":"),
@@ -1796,23 +1797,42 @@ def texture_slide_animation(efp_object):
         step = left[2]
         if not (1 <= columns <= 1024 and 1 <= rows <= 1024 and math.isfinite(step)):
             continue
+        stored_frames = source.value.get("frames", [])
         count = legacy_command_frame_count(source, efp_object.global_data_int)
         if count is None:
-            count = len(source.value.get("frames", []))
+            count = len(stored_frames)
         if count < 1:
             continue
         cell_count = columns * rows
         width = 1.0 / columns
         height = 1.0 / rows
+        # Render commands already contain the cells resolved by EasyFX.  They
+        # preserve repeated frames, custom ordering and non-uniform atlases;
+        # rebuilding only from columns/rows/step loses that information.
         frames = []
-        for index in range(count):
-            frame_index = math.trunc(index * step) % cell_count
-            frames.append((
-                (frame_index % columns) / columns,
-                ((frame_index // columns) % rows) / rows,
-                width,
-                height,
-            ))
+        for frame in stored_frames:
+            if not isinstance(frame, (tuple, list)) or len(frame) != 4:
+                continue
+            u, v, frame_width, frame_height = frame
+            if not all(math.isfinite(value) for value in frame):
+                continue
+            if frame_width <= 0.0 or frame_height <= 0.0:
+                continue
+            frames.append((u, v, frame_width, frame_height))
+
+        if frames:
+            frames = frames[:count]
+        else:
+            for index in range(count):
+                frame_index = math.trunc(index * step) % cell_count
+                frames.append((
+                    (frame_index % columns) / columns,
+                    ((frame_index // columns) % rows) / rows,
+                    width,
+                    height,
+                ))
+        if not frames:
+            continue
         # Legacy TextureSlide encodes its command window as 50 ms ticks in
         # span when span is above one; otherwise it uses ordinary seconds.
         if source.span > source.start and source.span > 1.0 and source.end > 0.0:
